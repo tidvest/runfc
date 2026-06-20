@@ -1,0 +1,172 @@
+name: RUN签到 (CloakBrowser)
+
+on:
+  schedule:
+    - cron: '30 1 * * *'
+  workflow_dispatch:
+    inputs:
+      enable_recording:
+        description: '是否录屏（仅手动触发时有效）'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安装系统依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            xvfb ffmpeg curl unzip \
+            fonts-noto-cjk \
+            libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
+            libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 \
+            libxfixes3 libxrandr2 libgbm1 \
+            libasound2t64 || sudo apt-get install -y -qq libasound2
+
+      - name: 安装 Python 依赖
+        run: |
+          pip install -r requirements.txt
+          python -c "from cloakbrowser import ensure_binary; ensure_binary()"
+
+      - name: 下载并启动 Xray 代理
+        env:
+          V2RAY_CONFIG: ${{ secrets.V2RAY_CONFIG }}
+        run: |
+          curl -sL https://github.com/XTLS/Xray-core/releases/download/v25.5.16/Xray-linux-64.zip -o xray.zip
+          unzip xray.zip && chmod +x xray
+          echo "$V2RAY_CONFIG" > config.json
+          ./xray run -c config.json &
+          sleep 5
+          echo "直连 IP："
+          curl -s --max-time 5 ifconfig.me
+          echo ""
+          echo "代理 IP："
+          curl -s --max-time 5 --socks5 127.0.0.1:10808 ifconfig.me
+          echo ""
+
+      - name: 运行脚本
+        env:
+          EMAIL: ${{ secrets.EMAIL }}
+          PASSWORD: ${{ secrets.PASSWORD }}
+          WXPUSHER_TOKEN: ${{ secrets.WXPUSHER_TOKEN }}
+          WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
+          DISPLAY: ":99"
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          GALLIUM_DRIVER: "llvmpipe"
+          # schedule 触发时 github.event_name == 'schedule'，enable_recording 输入不存在，默认空字符串
+          ENABLE_RECORDING: ${{ github.event.inputs.enable_recording }}
+        run: |
+          # 判断是否录屏：仅当手动触发且选择 true 时才录屏
+          if [ "$ENABLE_RECORDING" = "true" ]; then
+            DO_RECORD=true
+            echo "📹 录屏已开启"
+          else
+            DO_RECORD=false
+            echo "📹 录屏已关闭（定时任务默认不录屏）"
+          fi
+
+          # 启动 Xvfb 虚拟显示器
+          Xvfb :99 -screen 0 1280x720x24 +extension RANDR &
+          XVFB_PID=$!
+          sleep 2
+          DISPLAY=:99 xdpyinfo > /dev/null 2>&1 && echo "Xvfb 就绪" || echo "Xvfb 启动异常"
+
+          # 按需启动录屏
+          RECORD_PID=""
+          if [ "$DO_RECORD" = "true" ]; then
+            ffmpeg -f x11grab -video_size 1280x720 -framerate 15 -i :99 \
+              -codec:v libx264 -preset ultrafast -crf 28 \
+              -pix_fmt yuv420p -movflags +faststart /tmp/recording.mp4 \
+              > /tmp/ffmpeg.log 2>&1 &
+            RECORD_PID=$!
+            sleep 3
+            echo "录屏进程 PID: $RECORD_PID"
+          fi
+
+          # 运行签到脚本
+          timeout 270 python sign_cloakbrowser.py || echo "脚本退出码: $?"
+
+          echo "=== 截图目录内容 ==="
+          ls -la ./screenshots/ || echo "截图目录不存在"
+
+          # 停止录屏（如果开启了）
+          if [ -n "$RECORD_PID" ]; then
+            sleep 2
+            kill $RECORD_PID 2>/dev/null || true
+            wait $RECORD_PID 2>/dev/null || true
+            VIDEO_SIZE=$(stat -c%s /tmp/recording.mp4 2>/dev/null || echo 0)
+            echo "录像文件大小: ${VIDEO_SIZE} bytes"
+          fi
+
+          kill $XVFB_PID 2>/dev/null || true
+
+      - name: 上传截图
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-${{ github.run_number }}
+          path: ./screenshots/*.png
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: 上传录屏（仅手动录屏时）
+        if: always() && github.event.inputs.enable_recording == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: recording-${{ github.run_number }}
+          path: |
+            /tmp/recording.mp4
+            /tmp/ffmpeg.log
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: 清理旧 Runs（只保留最近 2 个）
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          REPO="${{ github.repository }}"
+          WORKFLOW_NAME="v2ray-sign.yml"
+
+          echo "获取 workflow ID..."
+          WORKFLOW_ID=$(gh api \
+            "repos/${REPO}/actions/workflows" \
+            --jq ".workflows[] | select(.path | endswith(\"${WORKFLOW_NAME}\")) | .id")
+
+          if [ -z "$WORKFLOW_ID" ]; then
+            echo "未找到 workflow，跳过清理"
+            exit 0
+          fi
+          echo "Workflow ID: $WORKFLOW_ID"
+
+          echo "获取全部 runs..."
+          RUN_IDS=$(gh api \
+            "repos/${REPO}/actions/workflows/${WORKFLOW_ID}/runs?per_page=100" \
+            --jq '.workflow_runs | sort_by(.run_number) | reverse | .[2:] | .[].id')
+
+          if [ -z "$RUN_IDS" ]; then
+            echo "没有需要清理的旧 runs"
+            exit 0
+          fi
+
+          for RUN_ID in $RUN_IDS; do
+            echo "删除 run: $RUN_ID"
+            gh api -X DELETE "repos/${REPO}/actions/runs/${RUN_ID}" || echo "删除 $RUN_ID 失败，跳过"
+          done
+          echo "✅ 清理完成"
