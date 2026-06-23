@@ -190,93 +190,109 @@ def wait_cf_pass(page, timeout=45) -> bool:
 # ---------- CF 复选框点击（移植自 zyno 的 click_turnstile_checkbox） ----------
 def click_cf_checkbox(page, timeout=45) -> bool:
     """
-    run.freecloud.ltd 现在的 CF 全页验证从"自动过"变成了需要手动点击
-    'Ik ben geen robot'（我不是机器人）复选框的 Managed Challenge 模式。
-    复选框本质上也是 Turnstile，渲染在指向 challenges.cloudflare.com 的
-    iframe 里，selector 打不进 shadow-root，只能：
-      1) 用 page.frames 枚举找到该 iframe（CDP 层面不受 shadow DOM 限制）
-      2) 用 frame_element().bounding_box() 拿到坐标后用鼠标坐标点击
-      3) 点击后轮询 is_cf_blocked() 看是否通过
-
-    关键点：全程不调用 page.goto / page.reload。点一次没过不代表失败，
-    可能是没点准、或者 CF 还要再核实一下，所以在 timeout 预算内反复
-    "找 iframe → 点 → 等几秒" 这套动作，而不是直接放弃去刷新页面
-    （刷新会让验证进度清零，等于白点）。
+    三阶段 CF 验证点击（参考 Zytrano 逻辑）：
+      阶段1：枚举 page.frames 找 CF iframe（CDP层面，不受 shadow-root 限制）
+             打印所有 frame URL 用于诊断
+      阶段2：frame_element().bounding_box() 拿坐标，鼠标点击
+             若枚举失败降级用 iframe selector 坐标点击
+      阶段3：点击后等待登录页邮箱 input 出现（最多 timeout 秒）
+             点完不能马上判断，CF 还需要一段时间处理
     """
 
-    def find_checkbox_box():
-        # 每轮重新枚举 page.frames，避免拿到已 detach 的旧引用
-        for _ in range(10):  # 最多找 5s
-            cf_frame = None
-            for f in page.frames:
-                if "challenges.cloudflare.com" in (f.url or ""):
-                    cf_frame = f
-                    break
-            if cf_frame:
-                try:
-                    box = cf_frame.frame_element().bounding_box()
-                    if box:
-                        return box
-                    # box 为 None：iframe 被替换中，下一轮重枚举
-                except Exception as e:
-                    log.warning(f"  frame_element().bounding_box() 失败: {e}，重新枚举...")
-            time.sleep(0.5)
-
-        # 降级：selector，只等 3s，避免卡 30s
+    def dump_frames(label: str):
         try:
-            box = page.locator('iframe[src*="challenges.cloudflare.com"]').first.bounding_box(timeout=3000)
+            frames = page.frames
+            log.info(f"[诊断/{label}] 当前共 {len(frames)} 个 frame：")
+            for i, f in enumerate(frames):
+                log.info(f"  [{i}] {(f.url or 'about:blank')[:150]}")
+        except Exception as e:
+            log.warning(f"[诊断/{label}] dump_frames 失败: {e}")
+
+    def login_page_ready() -> bool:
+        try:
+            return page.locator(
+                'input[name="email"], input[placeholder="请输入邮箱地址"]'
+            ).first.is_visible(timeout=500)
+        except Exception:
+            return False
+
+    # ── 阶段1：枚举 frames 找 CF iframe（最多 10s）──────────────
+    log.info("【CF 阶段1】枚举 page.frames 查找 CF iframe（最多 10s）...")
+    dump_frames("阶段1开始")
+    cf_frame = None
+    for tick in range(20):
+        for f in page.frames:
+            if "challenges.cloudflare.com" in (f.url or ""):
+                cf_frame = f
+                break
+        if cf_frame:
+            log.info(f"  ✅ 第 {tick * 0.5:.1f}s 找到 CF frame: {cf_frame.url[:100]}")
+            break
+        time.sleep(0.5)
+
+    # ── 阶段2：坐标点击 ──────────────────────────────────────────
+    clicked = False
+    if cf_frame:
+        time.sleep(1)  # 等 iframe 内部 JS 初始化
+        try:
+            frame_el = cf_frame.frame_element()
+            box = frame_el.bounding_box()
+            log.info(f"  [诊断] frame bounding_box={box}")
             if box:
-                return box
+                x = box["x"] + 25
+                y = box["y"] + box["height"] / 2
+                page.mouse.move(x, y)
+                time.sleep(random.uniform(0.2, 0.4))
+                page.mouse.click(x, y)
+                log.info(f"  ✅ 坐标点击 ({x:.0f}, {y:.0f})")
+                clicked = True
+            else:
+                log.warning("  bounding_box 为 None，iframe 可能未渲染")
         except Exception as e:
-            log.warning(f"  降级 iframe selector 取坐标失败: {e}")
-        return None
+            log.warning(f"  frame_element().bounding_box() 失败: {e}")
+    else:
+        log.warning("【CF 阶段1】枚举 10s 内未找到 CF frame，打印诊断...")
+        dump_frames("枚举失败")
 
-    deadline = time.time() + timeout
-    attempt = 0
-    while time.time() < deadline:
-        attempt += 1
-        log.info(f"【CF 复选框】第 {attempt} 次尝试点击...")
-
-        box = find_checkbox_box()
-        if not box:
-            log.warning(f"  第 {attempt} 次未找到复选框 iframe，1s 后重试...")
-            time.sleep(1)
-            continue
-
-        x = box["x"] + 25
-        y = box["y"] + box["height"] / 2
+    if not clicked:
+        # 降级：直接用 selector 坐标点击
+        log.info("  降级：尝试 iframe selector 坐标点击...")
         try:
-            page.mouse.move(x, y)
-            time.sleep(random.uniform(0.2, 0.4))
-            page.mouse.click(x, y)
-            log.info(f"  ✅ 第 {attempt} 次点击坐标 ({x:.0f}, {y:.0f})")
+            iframe_el = page.locator('iframe[src*="challenges.cloudflare.com"]').first
+            box = iframe_el.bounding_box(timeout=5000)
+            log.info(f"  [诊断] 降级 bounding_box={box}")
+            if box:
+                x = box["x"] + 25
+                y = box["y"] + box["height"] / 2
+                page.mouse.move(x, y)
+                time.sleep(random.uniform(0.2, 0.4))
+                page.mouse.click(x, y)
+                log.info(f"  ✅ 降级坐标点击 ({x:.0f}, {y:.0f})")
+                clicked = True
+            else:
+                log.error("  降级 bounding_box 也为 None")
         except Exception as e:
-            log.warning(f"  第 {attempt} 次点击失败: {e}")
-            time.sleep(1)
-            continue
+            log.warning(f"  降级 iframe selector 坐标失败: {e}")
 
-        take_screenshot(page, f"cf_checkbox_attempt_{attempt}")
+    if not clicked:
+        log.error("【CF 阶段2】坐标点击全部失败")
+        take_screenshot(page, "cf_checkbox_give_up")
+        return False
 
-        # 点击后 CF 在 iframe 内部切换状态（复选框→spinner→结果），
-        # iframe URL 全程不消失，不能靠它来判断。
-        # 老实等最多 15s，只看邮箱输入框是否出现。
-        log.info(f"  等待 CF 验证后目标页加载（最多 15s）...")
-        passed = False
-        for _ in range(30):
-            time.sleep(0.5)
-            try:
-                if page.locator('input[name="email"], input[placeholder="请输入邮箱地址"]').first.is_visible(timeout=500):
-                    log.info(f"✅ CF 验证通过，登录页已就绪（第 {attempt} 次点击后）")
-                    passed = True
-                    break
-            except Exception:
-                pass
-        if passed:
+    take_screenshot(page, "cf_checkbox_clicked")
+
+    # ── 阶段3：等待登录页就绪（最多 timeout 秒）────────────────
+    log.info(f"【CF 阶段3】等待登录页出现（最多 {timeout}s）...")
+    for i in range(timeout * 2):
+        if login_page_ready():
+            log.info(f"  ✅ CF 验证通过，登录页已就绪（{i * 0.5:.1f}s）")
             return True
+        if i % 10 == 0 and i > 0:
+            log.info(f"  等待中... {i * 0.5:.0f}s")
+            take_screenshot(page, f"cf_wait_{i}")
+        time.sleep(0.5)
 
-        log.info(f"  第 {attempt} 次点击后仍未通过，继续在当前页面重试...")
-
-    log.error(f"【CF 复选框】{timeout}s 内多次点击仍未通过")
+    log.error(f"【CF 阶段3】等待 {timeout}s 后登录页仍未出现")
     take_screenshot(page, "cf_checkbox_give_up")
     return False
 
@@ -398,17 +414,16 @@ def login(page, max_retries=3) -> bool:
             take_screenshot(page, f"login_fail_{attempt}")
             continue
 
-        # 用 js_click 代替 humanized click，避免 CF 验证后 viewport 丢失导致崩溃
+        # js_click + page.type 全程绕开 CloakBrowser human scroll
+        # （click/fill/type 都会走 scroll_to_element，CF后 viewport 丢失会崩）
         js_click(page, 'input[name="email"]', "邮箱输入框")
-        email_el = page.locator('input[name="email"]').first
-        email_el.fill("")
-        email_el.type(EMAIL, delay=random.randint(50, 120))
+        page.evaluate("document.querySelector('input[name=\"email\"]').value = ''")
+        page.type('input[name="email"]', EMAIL, delay=random.randint(50, 120))
         human_delay()
 
         js_click(page, 'input[name="password"]', "密码输入框")
-        pass_el = page.locator('input[name="password"]').first
-        pass_el.fill("")
-        pass_el.type(PASSWORD, delay=random.randint(50, 120))
+        page.evaluate("document.querySelector('input[name=\"password\"]').value = ''")
+        page.type('input[name="password"]', PASSWORD, delay=random.randint(50, 120))
         human_delay()
 
         captcha = fill_captcha(page)
