@@ -190,13 +190,12 @@ def wait_cf_pass(page, timeout=45) -> bool:
 # ---------- CF 复选框点击（移植自 zyno 的 click_turnstile_checkbox） ----------
 def click_cf_checkbox(page, timeout=45) -> bool:
     """
-    三阶段 CF 验证点击（参考 Zytrano 逻辑）：
-      阶段1：枚举 page.frames 找 CF iframe（CDP层面，不受 shadow-root 限制）
-             打印所有 frame URL 用于诊断
-      阶段2：frame_element().bounding_box() 拿坐标，鼠标点击
-             若枚举失败降级用 iframe selector 坐标点击
-      阶段3：点击后等待登录页邮箱 input 出现（最多 timeout 秒）
-             点完不能马上判断，CF 还需要一段时间处理
+    CF Turnstile 点击：
+      - 枚举 page.frames 找 CF iframe（CDP层面，不受 shadow-root 限制）
+      - 找到后等 frame 稳定（连续2次 bounding_box 一致），再点击
+        （CF 初始化时会销毁旧 iframe 挂新的，立刻拿到的是旧 frame，
+          等稳定后再点才是真正可点的那个）
+      - 点击后等登录页邮箱 input 出现（最多 timeout 秒）
     """
 
     def dump_frames(label: str):
@@ -216,64 +215,73 @@ def click_cf_checkbox(page, timeout=45) -> bool:
         except Exception:
             return False
 
-    # ── 阶段1：枚举 frames 找 CF iframe（最多 10s）──────────────
-    log.info("【CF 阶段1】枚举 page.frames 查找 CF iframe（最多 10s）...")
+    def find_stable_cf_frame(stable_timeout=12):
+        """
+        持续枚举 page.frames，找到 CF frame 后验证其 bounding_box 连续
+        2次非 None 且位置一致，确认 iframe 已稳定挂载再返回。
+        CF Turnstile 初始化会销毁旧 iframe 挂新的，tick=0 找到的往往是
+        正在被替换的旧 frame，等稳定后才是真正可点的那个。
+        """
+        deadline = time.time() + stable_timeout
+        while time.time() < deadline:
+            cf_frame = None
+            for f in page.frames:
+                if "challenges.cloudflare.com" in (f.url or ""):
+                    cf_frame = f
+                    break
+            if not cf_frame:
+                time.sleep(0.3)
+                continue
+            # 取第一次 bounding_box
+            try:
+                box1 = cf_frame.frame_element().bounding_box()
+            except Exception as e:
+                log.warning(f"  [稳定检测] frame_element 失败: {e}，继续等...")
+                time.sleep(0.3)
+                continue
+            if not box1:
+                log.warning("  [稳定检测] box1=None，iframe 未渲染，继续等...")
+                time.sleep(0.3)
+                continue
+            # 等 300ms 再取第二次，确认没被替换
+            time.sleep(0.3)
+            try:
+                box2 = cf_frame.frame_element().bounding_box()
+            except Exception as e:
+                log.warning(f"  [稳定检测] 二次确认 frame_element 失败: {e}，继续等...")
+                time.sleep(0.3)
+                continue
+            if box2 and abs(box2["y"] - box1["y"]) < 5:
+                log.info(f"  ✅ CF frame 稳定，bounding_box={box2}")
+                return cf_frame, box2
+            log.warning(f"  [稳定检测] 位置漂移 box1={box1} box2={box2}，继续等...")
+            time.sleep(0.3)
+        return None, None
+
+    # ── 阶段1：找稳定的 CF frame ────────────────────────────────
+    log.info("【CF 阶段1】查找稳定 CF iframe（最多 12s）...")
     dump_frames("阶段1开始")
-    cf_frame = None
-    for tick in range(20):
-        for f in page.frames:
-            if "challenges.cloudflare.com" in (f.url or ""):
-                cf_frame = f
-                break
-        if cf_frame:
-            log.info(f"  ✅ 第 {tick * 0.5:.1f}s 找到 CF frame: {cf_frame.url[:100]}")
-            break
-        time.sleep(0.5)
+    cf_frame, box = find_stable_cf_frame(stable_timeout=12)
 
     # ── 阶段2：坐标点击 ──────────────────────────────────────────
-    def try_click_frame(frame) -> bool:
-        """拿到 frame 引用后立刻取坐标点击，不 sleep，避免 detach。"""
-        try:
-            frame_el = frame.frame_element()
-            box = frame_el.bounding_box()
-            log.info(f"  [诊断] frame bounding_box={box}")
-            if box:
-                x = box["x"] + 25
-                y = box["y"] + box["height"] / 2
-                page.mouse.move(x, y)
-                time.sleep(random.uniform(0.2, 0.4))
-                page.mouse.click(x, y)
-                log.info(f"  ✅ 坐标点击 ({x:.0f}, {y:.0f})")
-                return True
-            else:
-                log.warning("  bounding_box 为 None，iframe 可能未渲染")
-        except Exception as e:
-            log.warning(f"  frame_element().bounding_box() 失败: {e}")
-        return False
-
     clicked = False
-    if cf_frame:
-        clicked = try_click_frame(cf_frame)
+    if cf_frame and box:
+        x = box["x"] + 25
+        y = box["y"] + box["height"] / 2
+        try:
+            page.mouse.move(x, y)
+            time.sleep(random.uniform(0.2, 0.4))
+            page.mouse.click(x, y)
+            log.info(f"  ✅ 坐标点击 ({x:.0f}, {y:.0f})")
+            clicked = True
+        except Exception as e:
+            log.warning(f"  坐标点击失败: {e}")
     else:
-        log.warning("【CF 阶段1】枚举 10s 内未找到 CF frame，打印诊断...")
+        log.warning("【CF 阶段1】未找到稳定 CF frame")
         dump_frames("枚举失败")
 
     if not clicked:
-        # 降级：CF 导航后重新枚举 frames，不等 selector（导航期间 selector 会卡住）
-        log.info("  降级：重新枚举 frames 找新挂载的 CF iframe（最多 8s）...")
-        for tick in range(16):
-            for f in page.frames:
-                if "challenges.cloudflare.com" in (f.url or ""):
-                    log.info(f"  [降级] 第 {tick * 0.5:.1f}s 找到新 frame: {f.url[:80]}")
-                    if try_click_frame(f):
-                        clicked = True
-                        break
-            if clicked:
-                break
-            time.sleep(0.5)
-
-    if not clicked:
-        log.error("【CF 阶段2】坐标点击全部失败")
+        log.error("【CF 阶段2】坐标点击失败")
         take_screenshot(page, "cf_checkbox_give_up")
         return False
 
@@ -412,15 +420,15 @@ def login(page, max_retries=3) -> bool:
             take_screenshot(page, f"login_fail_{attempt}")
             continue
 
-        # CloakBrowser가 click/fill/type/keyboard.type 전부 patch함
-        # keyboard.insert_text만 patch 안 됨 → 이걸로 입력
-        js_click(page, 'input[name="email"]', "邮箱输入框")
-        page.evaluate("document.querySelector('input[name=\"email\"]').value = ''")
+        # CloakBrowser patch了 click/fill/type/keyboard.type，CF后viewport丢失全崩
+        # focus() 确保真实焦点，insert_text 是CDP直接注入，不走human scroll
+        page.evaluate("document.querySelector(\"input[name='email']\").focus()")
+        page.evaluate("document.querySelector(\"input[name='email']\").value = ''")
         page.keyboard.insert_text(EMAIL)
         human_delay()
 
-        js_click(page, 'input[name="password"]', "密码输入框")
-        page.evaluate("document.querySelector('input[name=\"password\"]').value = ''")
+        page.evaluate("document.querySelector(\"input[name='password']\").focus()")
+        page.evaluate("document.querySelector(\"input[name='password']\").value = ''")
         page.keyboard.insert_text(PASSWORD)
         human_delay()
 
@@ -429,10 +437,9 @@ def login(page, max_retries=3) -> bool:
             log.warning("验证码识别失败，重试")
             continue
 
-        try:
-            page.locator("button.btn.btn-primary").first.click()
-        except:
-            page.get_by_role("button", name="登录").click()
+        # 登录按钮也用 js_click，避免 human click 崩
+        if not js_click(page, "button.btn.btn-primary", "登录按钮"):
+            js_click(page, "button[type='submit']", "登录按钮submit")
         log.info("已点击登录，检查跳转...")
 
         if wait_for_url_contains(page, "/clientarea", 10):
