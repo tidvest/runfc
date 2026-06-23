@@ -205,27 +205,26 @@ def click_cf_checkbox(page, timeout=45) -> bool:
     """
 
     def find_checkbox_box():
-        cf_frame = None
+        # 每轮重新枚举 page.frames，避免拿到已 detach 的旧引用
         for _ in range(10):  # 最多找 5s
+            cf_frame = None
             for f in page.frames:
                 if "challenges.cloudflare.com" in (f.url or ""):
                     cf_frame = f
                     break
             if cf_frame:
-                break
+                try:
+                    box = cf_frame.frame_element().bounding_box()
+                    if box:
+                        return box
+                    # box 为 None：iframe 被替换中，下一轮重枚举
+                except Exception as e:
+                    log.warning(f"  frame_element().bounding_box() 失败: {e}，重新枚举...")
             time.sleep(0.5)
 
-        if cf_frame:
-            try:
-                box = cf_frame.frame_element().bounding_box()
-                if box:
-                    return box
-            except Exception as e:
-                log.warning(f"  frame_element().bounding_box() 失败: {e}")
-
-        # 降级：直接用 selector 拿 iframe 坐标
+        # 降级：selector，只等 3s，避免卡 30s
         try:
-            box = page.locator('iframe[src*="challenges.cloudflare.com"]').first.bounding_box()
+            box = page.locator('iframe[src*="challenges.cloudflare.com"]').first.bounding_box(timeout=3000)
             if box:
                 return box
         except Exception as e:
@@ -399,14 +398,15 @@ def login(page, max_retries=3) -> bool:
             take_screenshot(page, f"login_fail_{attempt}")
             continue
 
+        # 用 js_click 代替 humanized click，避免 CF 验证后 viewport 丢失导致崩溃
+        js_click(page, 'input[name="email"]', "邮箱输入框")
         email_el = page.locator('input[name="email"]').first
-        email_el.click()
         email_el.fill("")
         email_el.type(EMAIL, delay=random.randint(50, 120))
         human_delay()
 
+        js_click(page, 'input[name="password"]', "密码输入框")
         pass_el = page.locator('input[name="password"]').first
-        pass_el.click()
         pass_el.fill("")
         pass_el.type(PASSWORD, delay=random.randint(50, 120))
         human_delay()
