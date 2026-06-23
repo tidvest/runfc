@@ -231,11 +231,10 @@ def click_cf_checkbox(page, timeout=45) -> bool:
         time.sleep(0.5)
 
     # ── 阶段2：坐标点击 ──────────────────────────────────────────
-    clicked = False
-    if cf_frame:
-        time.sleep(1)  # 等 iframe 内部 JS 初始化
+    def try_click_frame(frame) -> bool:
+        """拿到 frame 引用后立刻取坐标点击，不 sleep，避免 detach。"""
         try:
-            frame_el = cf_frame.frame_element()
+            frame_el = frame.frame_element()
             box = frame_el.bounding_box()
             log.info(f"  [诊断] frame bounding_box={box}")
             if box:
@@ -245,34 +244,33 @@ def click_cf_checkbox(page, timeout=45) -> bool:
                 time.sleep(random.uniform(0.2, 0.4))
                 page.mouse.click(x, y)
                 log.info(f"  ✅ 坐标点击 ({x:.0f}, {y:.0f})")
-                clicked = True
+                return True
             else:
                 log.warning("  bounding_box 为 None，iframe 可能未渲染")
         except Exception as e:
             log.warning(f"  frame_element().bounding_box() 失败: {e}")
+        return False
+
+    clicked = False
+    if cf_frame:
+        clicked = try_click_frame(cf_frame)
     else:
         log.warning("【CF 阶段1】枚举 10s 内未找到 CF frame，打印诊断...")
         dump_frames("枚举失败")
 
     if not clicked:
-        # 降级：直接用 selector 坐标点击
-        log.info("  降级：尝试 iframe selector 坐标点击...")
-        try:
-            iframe_el = page.locator('iframe[src*="challenges.cloudflare.com"]').first
-            box = iframe_el.bounding_box(timeout=5000)
-            log.info(f"  [诊断] 降级 bounding_box={box}")
-            if box:
-                x = box["x"] + 25
-                y = box["y"] + box["height"] / 2
-                page.mouse.move(x, y)
-                time.sleep(random.uniform(0.2, 0.4))
-                page.mouse.click(x, y)
-                log.info(f"  ✅ 降级坐标点击 ({x:.0f}, {y:.0f})")
-                clicked = True
-            else:
-                log.error("  降级 bounding_box 也为 None")
-        except Exception as e:
-            log.warning(f"  降级 iframe selector 坐标失败: {e}")
+        # 降级：CF 导航后重新枚举 frames，不等 selector（导航期间 selector 会卡住）
+        log.info("  降级：重新枚举 frames 找新挂载的 CF iframe（最多 8s）...")
+        for tick in range(16):
+            for f in page.frames:
+                if "challenges.cloudflare.com" in (f.url or ""):
+                    log.info(f"  [降级] 第 {tick * 0.5:.1f}s 找到新 frame: {f.url[:80]}")
+                    if try_click_frame(f):
+                        clicked = True
+                        break
+            if clicked:
+                break
+            time.sleep(0.5)
 
     if not clicked:
         log.error("【CF 阶段2】坐标点击全部失败")
@@ -414,16 +412,16 @@ def login(page, max_retries=3) -> bool:
             take_screenshot(page, f"login_fail_{attempt}")
             continue
 
-        # js_click + page.type 全程绕开 CloakBrowser human scroll
-        # （click/fill/type 都会走 scroll_to_element，CF后 viewport 丢失会崩）
+        # CloakBrowser가 click/fill/type/keyboard.type 전부 patch함
+        # keyboard.insert_text만 patch 안 됨 → 이걸로 입력
         js_click(page, 'input[name="email"]', "邮箱输入框")
         page.evaluate("document.querySelector('input[name=\"email\"]').value = ''")
-        page.type('input[name="email"]', EMAIL, delay=random.randint(50, 120))
+        page.keyboard.insert_text(EMAIL)
         human_delay()
 
         js_click(page, 'input[name="password"]', "密码输入框")
         page.evaluate("document.querySelector('input[name=\"password\"]').value = ''")
-        page.type('input[name="password"]', PASSWORD, delay=random.randint(50, 120))
+        page.keyboard.insert_text(PASSWORD)
         human_delay()
 
         captcha = fill_captcha(page)
