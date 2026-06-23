@@ -92,6 +92,46 @@ def js_click(page, selector, desc="") -> bool:
         log.warning(f"JS 点击失败 [{desc}]: {e}")
     return False
 
+def js_click_by_text(page, tag, text, desc="") -> bool:
+    """按钮没有稳定 selector 时，按可见文字匹配并用 JS 点击，绕开 CloakBrowser human click"""
+    try:
+        result = page.evaluate(f"""() => {{
+            var els = document.querySelectorAll('{tag}');
+            for (var el of els) {{
+                if (el.innerText && el.innerText.trim().includes('{text}') && el.offsetParent !== null) {{
+                    el.click();
+                    return true;
+                }}
+            }}
+            return false;
+        }}""")
+        if result:
+            log.info(f"JS 点击成功: {desc or text}")
+            return True
+        log.warning(f"JS 点击未找到元素 [{desc or text}]")
+    except Exception as e:
+        log.warning(f"JS 点击失败 [{desc or text}]: {e}")
+    return False
+
+def js_focus_and_type(page, selector, text, desc="") -> bool:
+    """focus() 是 DOM 原生聚焦（不像 js_click 的 .click() 不一定给真实焦点），
+    配合 insert_text（CDP 直接注入，未被 CloakBrowser patch）安全输入文字"""
+    try:
+        focused = page.evaluate(f"""() => {{
+            var el = document.querySelector('{selector}');
+            if (el) {{ el.focus(); el.value = ''; return true; }}
+            return false;
+        }}""")
+        if not focused:
+            log.warning(f"聚焦失败 [{desc or selector}]")
+            return False
+        page.keyboard.insert_text(text)
+        log.info(f"已输入 [{desc or selector}]: {text}")
+        return True
+    except Exception as e:
+        log.warning(f"输入失败 [{desc or selector}]: {e}")
+        return False
+
 def click_layui_ok(page, desc="确定") -> bool:
     """layui 弹窗确定是 <a class='layui-layer-btn0'>，不是 <button>"""
     result = page.evaluate("""() => {
@@ -477,7 +517,7 @@ def sign(page):
         take_screenshot(page, "02_sign_check")
         return None
 
-    page.get_by_role("button", name="我要签到").click()
+    js_click_by_text(page, "button", "我要签到", "我要签到按钮")
     log.info("已点击'我要签到'")
     time.sleep(1.5)
 
@@ -496,10 +536,8 @@ def sign(page):
         )
         log.info(f"数学题: {a} {op} {b} = {result_str}")
 
-        ans_el = page.locator('input[placeholder="请输入答案"]').first
-        ans_el.click()
-        ans_el.type(result_str, delay=80)
-        page.get_by_role("button", name="验证答案").click()
+        js_focus_and_type(page, 'input[placeholder="请输入答案"]', result_str, "答案输入框")
+        js_click_by_text(page, "button", "验证答案", "验证答案按钮")
         log.info("已点击验证答案，等待弹窗...")
         time.sleep(2)
 
@@ -623,6 +661,9 @@ def main():
         proxy=PROXY_SERVER,
         geoip=True,
     )
+    # headed 模式下 no_viewport=True 是 CloakBrowser 0.4.0+ 的默认行为（无需显式传）；
+    # 真正修复"Viewport size not available"崩溃的是 0.4.1 版本里 page.evaluate
+    # 兜底读取 window.innerWidth/innerHeight，所以 requirements.txt 必须 >=0.4.1
     page = browser.new_page()
 
     try:
