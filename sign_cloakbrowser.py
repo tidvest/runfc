@@ -378,11 +378,15 @@ def navigate(page, url, timeout=60) -> bool:
     if not is_cf_blocked(page):
         return True
 
-    # 先给被动自动过留一点时间（10s），万一这次又自动过了，不用点击
-    if wait_cf_pass(page, timeout=10):
+    # 给被动自动过留足时间——这种站点常见的是"非交互式 Managed Challenge"
+    # （没有可点击的复选框，纯后台 JS/指纹校验），10s 经常等不到它跑完，
+    # 实测一般需要 20~35s 才会出现"Verificatie geslaagd"。40s 留够余量，
+    # wait_cf_pass 内部是逐秒轮询，提前过了就立刻返回，不会真的傻等 40s
+    if wait_cf_pass(page, timeout=40):
         return True
 
-    # 被动等待没过：在当前页面反复尝试点击复选框，全程不重新 goto/reload
+    # 被动等了 40s 还没过，大概率是真的需要交互的 Turnstile checkbox，
+    # 这才进入点击逻辑（在当前页面反复尝试点击复选框，全程不重新 goto/reload）
     log.info("CF 被动等待未通过，开始在当前页面尝试点击复选框...")
     if click_cf_checkbox(page, timeout=timeout):
         return True
@@ -395,7 +399,7 @@ def navigate(page, url, timeout=60) -> bool:
         pass
     if not is_cf_blocked(page):
         return True
-    if wait_cf_pass(page, timeout=10):
+    if wait_cf_pass(page, timeout=40):
         return True
     return click_cf_checkbox(page, timeout=30)
 
