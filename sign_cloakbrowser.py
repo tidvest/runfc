@@ -464,16 +464,19 @@ def login(page, max_retries=3) -> bool:
             take_screenshot(page, f"login_fail_{attempt}")
             continue
 
-        # CloakBrowser patch了 click/fill/type/keyboard.type，CF后viewport丢失全崩
-        # focus() 确保真实焦点，insert_text 是CDP直接注入，不走human scroll
-        page.evaluate("document.querySelector(\"input[name='email']\").focus()")
-        page.evaluate("document.querySelector(\"input[name='email']\").value = ''")
-        page.keyboard.insert_text(EMAIL)
+        # cloakbrowser>=0.4.1 已修复 headed 模式下 viewport 兜底崩溃问题，
+        # 改回用 humanize 的真人点击+逐字输入，而不是 insert_text 瞬间填入
+        # （瞬间填入太假，容易被行为分析识别为脚本）
+        email_el = page.locator('input[name="email"]').first
+        email_el.click()
+        email_el.fill("")
+        page.type('input[name="email"]', EMAIL, delay=random.randint(60, 140))
         human_delay()
 
-        page.evaluate("document.querySelector(\"input[name='password']\").focus()")
-        page.evaluate("document.querySelector(\"input[name='password']\").value = ''")
-        page.keyboard.insert_text(PASSWORD)
+        pass_el = page.locator('input[name="password"]').first
+        pass_el.click()
+        pass_el.fill("")
+        page.type('input[name="password"]', PASSWORD, delay=random.randint(60, 140))
         human_delay()
 
         captcha = fill_captcha(page)
@@ -481,9 +484,16 @@ def login(page, max_retries=3) -> bool:
             log.warning("验证码识别失败，重试")
             continue
 
-        # 登录按钮也用 js_click，避免 human click 崩
-        if not js_click(page, "button.btn.btn-primary", "登录按钮"):
-            js_click(page, "button[type='submit']", "登录按钮submit")
+        # 登录按钮同样改回真人点击（cloakbrowser>=0.4.1 已不会崩）
+        try:
+            page.locator("button.btn.btn-primary").first.click()
+        except Exception:
+            try:
+                page.locator("button[type='submit']").first.click()
+            except Exception as e:
+                log.warning(f"登录按钮 human click 失败，降级 js_click: {e}")
+                if not js_click(page, "button.btn.btn-primary", "登录按钮"):
+                    js_click(page, "button[type='submit']", "登录按钮submit")
         log.info("已点击登录，检查跳转...")
 
         if wait_for_url_contains(page, "/clientarea", 10):
